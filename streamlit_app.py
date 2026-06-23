@@ -102,6 +102,19 @@ def render_decision(decision):
         st.error("Final Decision: Reject")
 
 
+def combine_credit_and_pricing_decision(credit_recommendation, pricing_decision):
+    """Combine risk policy and pricing economics into one lending action."""
+    if credit_recommendation == "Reject":
+        return "Reject"
+
+    if credit_recommendation == "Review":
+        if pricing_decision == "Reject":
+            return "Reject"
+        return "Manual Review"
+
+    return pricing_decision
+
+
 def get_drivers(explanations, borrower_id):
     if explanations.empty:
         return [], []
@@ -246,280 +259,403 @@ with left:
         horizontal=True,
     )
 
+    if st.session_state.get("applicant_mode") != applicant_mode:
+        st.session_state["applicant_mode"] = applicant_mode
+        st.session_state.pop("decision_result", None)
+
     if applicant_mode == "Existing borrower":
-        borrower_ids = borrowers["SK_ID_CURR"].astype(int).tolist()
-        selected_borrower = st.selectbox("Borrower ID", borrower_ids)
-        row = borrowers[borrowers["SK_ID_CURR"].eq(selected_borrower)].iloc[0].copy()
-        live_score = score_existing_borrower_live(int(selected_borrower))
-        row["pd_raw"] = live_score["pd_raw"]
-        row["pd_calibrated"] = live_score["pd_calibrated"]
-        row["credit_grade"] = live_score["credit_grade"]
-        row["decision_recommendation"] = live_score["decision_recommendation"]
-        score_source = live_score["score_source"]
+        with st.form("existing_borrower_form"):
+            borrower_ids = borrowers["SK_ID_CURR"].astype(int).tolist()
+            selected_borrower = st.selectbox("Borrower ID", borrower_ids)
+
+            st.subheader("Pricing Inputs")
+            selected_row = borrowers[
+                borrowers["SK_ID_CURR"].eq(selected_borrower)
+            ].iloc[0]
+            loan_amount = st.number_input(
+                "Loan amount / EAD",
+                min_value=1_000.0,
+                max_value=3_000_000.0,
+                value=max(safe_float(selected_row.get("EAD"), 1_000.0), 1_000.0),
+                step=10_000.0,
+            )
+            offered_rate = st.slider(
+                "Offered annual interest rate",
+                min_value=0.00,
+                max_value=0.50,
+                value=0.12,
+                step=0.0025,
+                format="%.3f",
+            )
+            term_months = st.selectbox("Loan term", [12, 24, 36, 48, 60], index=2)
+
+            st.markdown("**Business assumptions**")
+            a1, a2 = st.columns(2)
+            funding_cost_rate = a1.slider("Funding cost", 0.00, 0.25, 0.04, 0.0025)
+            operating_cost_rate = a2.slider("Operating cost", 0.00, 0.20, 0.02, 0.0025)
+            target_margin_rate = a1.slider("Target margin", 0.00, 0.25, 0.03, 0.0025)
+            capital_cost_rate = a2.slider("Capital cost", 0.00, 0.50, 0.08, 0.005)
+            collection_cost_rate = a1.slider("Collection cost", 0.00, 0.50, 0.10, 0.005)
+            tail_risk_multiplier = a2.slider("Tail risk multiplier", 0.00, 2.00, 0.35, 0.05)
+            max_allowed_rate = a1.slider("Maximum allowed rate", 0.05, 0.60, 0.30, 0.005)
+
+            submitted = st.form_submit_button(
+                "Run Credit & Pricing Decision",
+                use_container_width=True,
+            )
+
+        if submitted:
+            with st.spinner("Running live credit scoring and pricing decision..."):
+                row = selected_row.copy()
+                live_score = score_existing_borrower_live(int(selected_borrower))
+                row["pd_raw"] = live_score["pd_raw"]
+                row["pd_calibrated"] = live_score["pd_calibrated"]
+                row["credit_grade"] = live_score["credit_grade"]
+                row["decision_recommendation"] = live_score["decision_recommendation"]
+                score_source = live_score["score_source"]
+
+                grade = str(row.get("credit_grade", "Unrated"))
+                pd_value = safe_float(row["pd_calibrated"])
+                lgd = safe_float(row.get("LGD"), lgd_from_grade(grade))
+                credit_recommendation = row.get("decision_recommendation", "-")
+                pricing = calculate_loan_pricing(
+                    loan_amount=loan_amount,
+                    term_months=int(term_months),
+                    offered_rate=float(offered_rate),
+                    pd_value=pd_value,
+                    lgd=lgd,
+                    funding_cost_rate=float(funding_cost_rate),
+                    operating_cost_rate=float(operating_cost_rate),
+                    target_margin_rate=float(target_margin_rate),
+                    capital_cost_rate=float(capital_cost_rate),
+                    collection_cost_rate=float(collection_cost_rate),
+                    tail_risk_multiplier=float(tail_risk_multiplier),
+                    max_allowed_rate=float(max_allowed_rate),
+                )
+                final_decision = combine_credit_and_pricing_decision(
+                    credit_recommendation=credit_recommendation,
+                    pricing_decision=pricing["decision"],
+                )
+
+                st.session_state["decision_result"] = {
+                    "mode": applicant_mode,
+                    "borrower_id": int(selected_borrower),
+                    "row": row,
+                    "score_source": score_source,
+                    "loan_amount": loan_amount,
+                    "pricing": pricing,
+                    "final_decision": final_decision,
+                }
     else:
-        selected_borrower = None
-        n1, n2 = st.columns(2)
-        income = n1.number_input(
-            "Annual income",
-            min_value=10_000.0,
-            max_value=2_000_000.0,
-            value=180_000.0,
-            step=10_000.0,
-        )
-        requested_credit = n2.number_input(
-            "Requested credit amount",
-            min_value=10_000.0,
-            max_value=3_000_000.0,
-            value=500_000.0,
-            step=10_000.0,
-        )
-        annuity = n1.number_input(
-            "Regular payment amount",
-            min_value=1_000.0,
-            max_value=300_000.0,
-            value=25_000.0,
-            step=1_000.0,
-        )
-        goods_price = n2.number_input(
-            "Goods price",
-            min_value=10_000.0,
-            max_value=3_000_000.0,
-            value=450_000.0,
-            step=10_000.0,
-        )
-        contract_type = n1.selectbox("Contract type", ["Cash loans", "Revolving loans"])
-        family_status = n2.selectbox(
-            "Family status",
-            ["Married", "Single / not married", "Civil marriage", "Separated", "Widow"],
-        )
-        owns_car = n1.selectbox("Owns car", ["N", "Y"])
-        owns_realty = n2.selectbox("Owns realty", ["Y", "N"])
-        ext_source_2 = n1.slider("External credit score 2", 0.0, 1.0, 0.50, 0.01)
-        ext_source_3 = n2.slider("External credit score 3", 0.0, 1.0, 0.50, 0.01)
-        temporal_assumption = st.selectbox(
-            "Repayment history assumption",
-            [
-                "No prior repayment history",
-                "Stable payer",
-                "Mild deterioration",
-                "High delinquency",
-                "Recovering borrower",
-            ],
-        )
+        with st.form("new_borrower_form"):
+            n1, n2 = st.columns(2)
+            income = n1.number_input(
+                "Annual income",
+                min_value=10_000.0,
+                max_value=2_000_000.0,
+                value=180_000.0,
+                step=10_000.0,
+            )
+            requested_credit = n2.number_input(
+                "Requested credit amount",
+                min_value=10_000.0,
+                max_value=3_000_000.0,
+                value=500_000.0,
+                step=10_000.0,
+            )
+            annuity = n1.number_input(
+                "Regular payment amount",
+                min_value=1_000.0,
+                max_value=300_000.0,
+                value=25_000.0,
+                step=1_000.0,
+            )
+            goods_price = n2.number_input(
+                "Goods price",
+                min_value=10_000.0,
+                max_value=3_000_000.0,
+                value=450_000.0,
+                step=10_000.0,
+            )
+            contract_type = n1.selectbox("Contract type", ["Cash loans", "Revolving loans"])
+            family_status = n2.selectbox(
+                "Family status",
+                ["Married", "Single / not married", "Civil marriage", "Separated", "Widow"],
+            )
+            owns_car = n1.selectbox("Owns car", ["N", "Y"])
+            owns_realty = n2.selectbox("Owns realty", ["Y", "N"])
+            ext_source_2 = n1.slider("External credit score 2", 0.0, 1.0, 0.50, 0.01)
+            ext_source_3 = n2.slider("External credit score 3", 0.0, 1.0, 0.50, 0.01)
+            temporal_assumption = st.selectbox(
+                "Repayment history assumption",
+                [
+                    "No prior repayment history",
+                    "Stable payer",
+                    "Mild deterioration",
+                    "High delinquency",
+                    "Recovering borrower",
+                ],
+            )
 
-        new_inputs = {
-            "AMT_INCOME_TOTAL": income,
-            "AMT_CREDIT": requested_credit,
-            "AMT_ANNUITY": annuity,
-            "AMT_GOODS_PRICE": goods_price,
-            "NAME_CONTRACT_TYPE": contract_type,
-            "NAME_FAMILY_STATUS": family_status,
-            "FLAG_OWN_CAR": owns_car,
-            "FLAG_OWN_REALTY": owns_realty,
-            "EXT_SOURCE_2": ext_source_2,
-            "EXT_SOURCE_3": ext_source_3,
-        }
-        live_score = score_new_borrower_live(new_inputs, temporal_assumption)
-        row = pd.Series(
-            {
-                "SK_ID_CURR": "New application",
-                "AMT_INCOME_TOTAL": income,
-                "AMT_CREDIT": requested_credit,
-                "AMT_ANNUITY": annuity,
-                "AMT_GOODS_PRICE": goods_price,
-                "NAME_CONTRACT_TYPE": contract_type,
-                "NAME_FAMILY_STATUS": family_status,
-                "EAD": requested_credit,
-                "pd_raw": live_score["pd_raw"],
-                "pd_calibrated": live_score["pd_calibrated"],
-                "credit_grade": live_score["credit_grade"],
-                "decision_recommendation": live_score["decision_recommendation"],
-            }
-        )
-        score_source = live_score["score_source"]
+            st.subheader("Pricing Inputs")
+            loan_amount = st.number_input(
+                "Loan amount / EAD",
+                min_value=1_000.0,
+                max_value=3_000_000.0,
+                value=max(requested_credit, 1_000.0),
+                step=10_000.0,
+            )
+            offered_rate = st.slider(
+                "Offered annual interest rate",
+                min_value=0.00,
+                max_value=0.50,
+                value=0.12,
+                step=0.0025,
+                format="%.3f",
+            )
+            term_months = st.selectbox("Loan term", [12, 24, 36, 48, 60], index=2)
 
-    profile_cols = st.columns(2)
-    profile_cols[0].metric("Income", fmt_currency(row.get("AMT_INCOME_TOTAL")))
-    profile_cols[1].metric("Credit Exposure", fmt_currency(row.get("EAD")))
-    profile_cols[0].metric("Annuity", fmt_currency(row.get("AMT_ANNUITY")))
-    profile_cols[1].metric("Goods Price", fmt_currency(row.get("AMT_GOODS_PRICE")))
-    profile_cols[0].metric("Contract", row.get("NAME_CONTRACT_TYPE", "-"))
-    profile_cols[1].metric("Family Status", row.get("NAME_FAMILY_STATUS", "-"))
-    st.caption(f"Credit score source: {score_source}")
+            st.markdown("**Business assumptions**")
+            a1, a2 = st.columns(2)
+            funding_cost_rate = a1.slider("Funding cost", 0.00, 0.25, 0.04, 0.0025)
+            operating_cost_rate = a2.slider("Operating cost", 0.00, 0.20, 0.02, 0.0025)
+            target_margin_rate = a1.slider("Target margin", 0.00, 0.25, 0.03, 0.0025)
+            capital_cost_rate = a2.slider("Capital cost", 0.00, 0.50, 0.08, 0.005)
+            collection_cost_rate = a1.slider("Collection cost", 0.00, 0.50, 0.10, 0.005)
+            tail_risk_multiplier = a2.slider("Tail risk multiplier", 0.00, 2.00, 0.35, 0.05)
+            max_allowed_rate = a1.slider("Maximum allowed rate", 0.05, 0.60, 0.30, 0.005)
 
-    st.subheader("Pricing Inputs")
-    loan_amount = st.number_input(
-        "Loan amount / EAD",
-        min_value=1_000.0,
-        max_value=3_000_000.0,
-        value=max(safe_float(row.get("EAD"), 1_000.0), 1_000.0),
-        step=10_000.0,
-    )
-    offered_rate = st.slider(
-        "Offered annual interest rate",
-        min_value=0.00,
-        max_value=0.50,
-        value=0.12,
-        step=0.0025,
-        format="%.3f",
-    )
-    term_months = st.selectbox("Loan term", [12, 24, 36, 48, 60], index=2)
+            submitted = st.form_submit_button(
+                "Run Credit & Pricing Decision",
+                use_container_width=True,
+            )
 
-    with st.expander("Business assumptions", expanded=False):
-        a1, a2 = st.columns(2)
-        funding_cost_rate = a1.slider("Funding cost", 0.00, 0.25, 0.04, 0.0025)
-        operating_cost_rate = a2.slider("Operating cost", 0.00, 0.20, 0.02, 0.0025)
-        target_margin_rate = a1.slider("Target margin", 0.00, 0.25, 0.03, 0.0025)
-        capital_cost_rate = a2.slider("Capital cost", 0.00, 0.50, 0.08, 0.005)
-        collection_cost_rate = a1.slider("Collection cost", 0.00, 0.50, 0.10, 0.005)
-        tail_risk_multiplier = a2.slider("Tail risk multiplier", 0.00, 2.00, 0.35, 0.05)
-        max_allowed_rate = a1.slider("Maximum allowed rate", 0.05, 0.60, 0.30, 0.005)
+        if submitted:
+            with st.spinner("Running live new-borrower simulation and pricing decision..."):
+                new_inputs = {
+                    "AMT_INCOME_TOTAL": income,
+                    "AMT_CREDIT": requested_credit,
+                    "AMT_ANNUITY": annuity,
+                    "AMT_GOODS_PRICE": goods_price,
+                    "NAME_CONTRACT_TYPE": contract_type,
+                    "NAME_FAMILY_STATUS": family_status,
+                    "FLAG_OWN_CAR": owns_car,
+                    "FLAG_OWN_REALTY": owns_realty,
+                    "EXT_SOURCE_2": ext_source_2,
+                    "EXT_SOURCE_3": ext_source_3,
+                }
+                live_score = score_new_borrower_live(new_inputs, temporal_assumption)
+                row = pd.Series(
+                    {
+                        "SK_ID_CURR": "New application",
+                        "AMT_INCOME_TOTAL": income,
+                        "AMT_CREDIT": requested_credit,
+                        "AMT_ANNUITY": annuity,
+                        "AMT_GOODS_PRICE": goods_price,
+                        "NAME_CONTRACT_TYPE": contract_type,
+                        "NAME_FAMILY_STATUS": family_status,
+                        "EAD": requested_credit,
+                        "pd_raw": live_score["pd_raw"],
+                        "pd_calibrated": live_score["pd_calibrated"],
+                        "credit_grade": live_score["credit_grade"],
+                        "decision_recommendation": live_score["decision_recommendation"],
+                    }
+                )
+                score_source = live_score["score_source"]
+                grade = str(row.get("credit_grade", "Unrated"))
+                pd_value = safe_float(row["pd_calibrated"])
+                lgd = lgd_from_grade(grade)
+                credit_recommendation = row.get("decision_recommendation", "-")
+                pricing = calculate_loan_pricing(
+                    loan_amount=loan_amount,
+                    term_months=int(term_months),
+                    offered_rate=float(offered_rate),
+                    pd_value=pd_value,
+                    lgd=lgd,
+                    funding_cost_rate=float(funding_cost_rate),
+                    operating_cost_rate=float(operating_cost_rate),
+                    target_margin_rate=float(target_margin_rate),
+                    capital_cost_rate=float(capital_cost_rate),
+                    collection_cost_rate=float(collection_cost_rate),
+                    tail_risk_multiplier=float(tail_risk_multiplier),
+                    max_allowed_rate=float(max_allowed_rate),
+                )
+                final_decision = combine_credit_and_pricing_decision(
+                    credit_recommendation=credit_recommendation,
+                    pricing_decision=pricing["decision"],
+                )
+
+                st.session_state["decision_result"] = {
+                    "mode": applicant_mode,
+                    "borrower_id": None,
+                    "row": row,
+                    "score_source": score_source,
+                    "loan_amount": loan_amount,
+                    "pricing": pricing,
+                    "final_decision": final_decision,
+                }
+
+result = st.session_state.get("decision_result")
 
 with right:
-    st.subheader("2. Credit Risk Result")
+    if result is None:
+        st.subheader("2. Credit Risk Result")
+        st.info("Enter borrower and pricing inputs, then click Run Credit & Pricing Decision.")
+    else:
+        row = result["row"]
+        score_source = result["score_source"]
+        loan_amount = result["loan_amount"]
+        pricing = result["pricing"]
+        final_decision = result["final_decision"]
 
-    pd_value = safe_float(row["pd_calibrated"])
-    grade = str(row.get("credit_grade", "Unrated"))
-    lgd = safe_float(row.get("LGD"), lgd_from_grade(grade))
-    ead = safe_float(row.get("EAD"), loan_amount)
-    ecl_base = safe_float(row.get("ECL_base"), pd_value * lgd * ead)
-    credit_recommendation = row.get("decision_recommendation", "-")
-    ecl_base = pd_value * lgd * ead
+        profile_cols = st.columns(3)
+        profile_cols[0].metric("Income", fmt_currency(row.get("AMT_INCOME_TOTAL")))
+        profile_cols[1].metric("Credit Exposure", fmt_currency(row.get("EAD")))
+        profile_cols[2].metric("Score Source", score_source)
 
-    risk_cols = st.columns(5)
-    risk_cols[0].metric("Calibrated PD", fmt_pct(pd_value))
-    risk_cols[1].metric("Credit Grade", grade)
-    risk_cols[2].metric("LGD", fmt_pct(lgd))
-    risk_cols[3].metric("EAD", fmt_currency(ead))
-    risk_cols[4].metric("ECL", fmt_currency(ecl_base))
+        st.subheader("2. Credit Risk Result")
 
-    st.caption(f"Credit model recommendation: {credit_recommendation}")
+        pd_value = safe_float(row["pd_calibrated"])
+        grade = str(row.get("credit_grade", "Unrated"))
+        lgd = safe_float(row.get("LGD"), lgd_from_grade(grade))
+        ead = safe_float(row.get("EAD"), loan_amount)
+        ecl_base = pd_value * lgd * ead
+        credit_recommendation = row.get("decision_recommendation", "-")
 
-    pricing = calculate_loan_pricing(
-        loan_amount=loan_amount,
-        term_months=int(term_months),
-        offered_rate=float(offered_rate),
-        pd_value=pd_value,
-        lgd=lgd,
-        funding_cost_rate=float(funding_cost_rate),
-        operating_cost_rate=float(operating_cost_rate),
-        target_margin_rate=float(target_margin_rate),
-        capital_cost_rate=float(capital_cost_rate),
-        collection_cost_rate=float(collection_cost_rate),
-        tail_risk_multiplier=float(tail_risk_multiplier),
-        max_allowed_rate=float(max_allowed_rate),
-    )
+        risk_cols = st.columns(5)
+        risk_cols[0].metric("Calibrated PD", fmt_pct(pd_value))
+        risk_cols[1].metric("Credit Grade", grade)
+        risk_cols[2].metric("LGD", fmt_pct(lgd))
+        risk_cols[3].metric("EAD", fmt_currency(ead))
+        risk_cols[4].metric("ECL", fmt_currency(ecl_base))
 
-    st.subheader("3. Pricing Recommendation")
+        st.caption(f"Credit model recommendation: {credit_recommendation}")
 
-    price_cols = st.columns(4)
-    price_cols[0].metric("Required Rate", fmt_pct(pricing["required_rate"]))
-    price_cols[1].metric("Offered Rate", fmt_pct(pricing["offered_rate"]))
-    price_cols[2].metric("Pricing Gap", fmt_pct(pricing["pricing_gap"]))
-    price_cols[3].metric("Economic Profit", fmt_currency(pricing["economic_profit"]))
+        st.subheader("3. Pricing Recommendation")
 
-    render_decision(pricing["decision"])
-    st.caption(f"Pricing status: {pricing['pricing_status']}")
+        price_cols = st.columns(4)
+        price_cols[0].metric("Required Rate", fmt_pct(pricing["required_rate"]))
+        price_cols[1].metric("Offered Rate", fmt_pct(pricing["offered_rate"]))
+        price_cols[2].metric("Pricing Gap", fmt_pct(pricing["pricing_gap"]))
+        price_cols[3].metric("Economic Profit", fmt_currency(pricing["economic_profit"]))
 
-    profit_chart = pd.DataFrame(
-        {
-            "Economic Profit": {
-                "Current Offer": pricing["economic_profit"],
-                "If Repriced": pricing["repriced_economic_profit"],
-            }
-        }
-    )
-    st.bar_chart(profit_chart)
+        render_decision(final_decision)
+        st.caption(
+            f"Credit policy: {credit_recommendation} | "
+            f"Pricing economics: {pricing['decision']} | "
+            f"Pricing status: {pricing['pricing_status']}"
+        )
 
-st.divider()
-
-stress_col, explanation_col = st.columns(2, gap="large")
-
-with stress_col:
-    st.subheader("4. Stress Scenario / What-if")
-
-    s1, s2 = st.columns(2)
-    income_decline_pct = s1.slider(
-        "Income decline",
-        min_value=0,
-        max_value=80,
-        value=20,
-        step=5,
-        format="%d%%",
-    )
-    exposure_increase_pct = s2.slider(
-        "Exposure increase",
-        min_value=0,
-        max_value=100,
-        value=10,
-        step=5,
-        format="%d%%",
-    )
-    repayment_stress = st.selectbox(
-        "Repayment behavior",
-        [
-            "No change",
-            "Mild deterioration",
-            "Repeated late payments",
-            "Severe delinquency",
-        ],
-        index=1,
-    )
-
-    stress = apply_borrower_stress(
-        base_pd=pd_value,
-        base_ead=loan_amount,
-        income_decline_pct=income_decline_pct,
-        exposure_increase_pct=exposure_increase_pct,
-        repayment_stress=repayment_stress,
-    )
-    stressed_ecl = stress["stressed_pd"] * lgd * stress["stressed_ead"]
-
-    stress_metrics = st.columns(3)
-    stress_metrics[0].metric(
-        "Stressed PD",
-        fmt_pct(stress["stressed_pd"]),
-        delta=fmt_pct(stress["stressed_pd"] - pd_value),
-    )
-    stress_metrics[1].metric("Risk Multiplier", f"{stress['pd_multiplier']:.2f}x")
-    stress_metrics[2].metric("Stressed ECL", fmt_currency(stressed_ecl))
-
-    st.bar_chart(
-        pd.DataFrame(
+        profit_chart = pd.DataFrame(
             {
-                "Expected Loss": {
-                    "Baseline": pricing["expected_loss"],
-                    "Stressed": stressed_ecl,
+                "Economic Profit": {
+                    "Current Offer": pricing["economic_profit"],
+                    "If Repriced": pricing["repriced_economic_profit"],
                 }
             }
         )
-    )
+        st.bar_chart(profit_chart)
 
-with explanation_col:
-    st.subheader("5. Explanation / Risk Drivers")
+if result is not None:
+    st.divider()
 
-    if applicant_mode == "Existing borrower":
-        risk_drivers, support_drivers = get_drivers(explanations, int(selected_borrower))
-    else:
-        risk_drivers, support_drivers = [], []
+    stress_col, explanation_col = st.columns(2, gap="large")
 
-    if risk_drivers:
-        st.markdown("**Main risk drivers**")
-        for driver in risk_drivers:
-            st.write(f"- {driver}")
-    else:
-        st.write("No borrower-level risk driver artifact is available for this application.")
+    row = result["row"]
+    loan_amount = result["loan_amount"]
+    pricing = result["pricing"]
+    pd_value = safe_float(row["pd_calibrated"])
+    grade = str(row.get("credit_grade", "Unrated"))
+    lgd = safe_float(row.get("LGD"), lgd_from_grade(grade))
 
-    if support_drivers:
-        st.markdown("**Supportive factors**")
-        for driver in support_drivers:
-            st.write(f"- {driver}")
+    with stress_col:
+        st.subheader("4. Stress Scenario / What-if")
 
-    st.markdown("**Limitations**")
-    st.write(
-        "- Pricing is a decision-support simulation, not a regulatory pricing engine.\n"
-        "- LGD is assumption-based because recovery outcomes are unavailable.\n"
-        "- New-borrower scoring uses a form-based profile and a repayment-history assumption.\n"
-        "- Stress testing is a what-if overlay, not a retrained model prediction.\n"
-        "- Final lending action should remain subject to underwriting policy and analyst review."
-    )
+        s1, s2 = st.columns(2)
+        income_decline_pct = s1.slider(
+            "Income decline",
+            min_value=0,
+            max_value=80,
+            value=20,
+            step=5,
+            format="%d%%",
+        )
+        exposure_increase_pct = s2.slider(
+            "Exposure increase",
+            min_value=0,
+            max_value=100,
+            value=10,
+            step=5,
+            format="%d%%",
+        )
+        repayment_stress = st.selectbox(
+            "Repayment behavior",
+            [
+                "No change",
+                "Mild deterioration",
+                "Repeated late payments",
+                "Severe delinquency",
+            ],
+            index=1,
+        )
+
+        stress = apply_borrower_stress(
+            base_pd=pd_value,
+            base_ead=loan_amount,
+            income_decline_pct=income_decline_pct,
+            exposure_increase_pct=exposure_increase_pct,
+            repayment_stress=repayment_stress,
+        )
+        stressed_ecl = stress["stressed_pd"] * lgd * stress["stressed_ead"]
+
+        stress_metrics = st.columns(3)
+        stress_metrics[0].metric(
+            "Stressed PD",
+            fmt_pct(stress["stressed_pd"]),
+            delta=fmt_pct(stress["stressed_pd"] - pd_value),
+        )
+        stress_metrics[1].metric("Risk Multiplier", f"{stress['pd_multiplier']:.2f}x")
+        stress_metrics[2].metric("Stressed ECL", fmt_currency(stressed_ecl))
+
+        st.bar_chart(
+            pd.DataFrame(
+                {
+                    "Expected Loss": {
+                        "Baseline": pricing["expected_loss"],
+                        "Stressed": stressed_ecl,
+                    }
+                }
+            )
+        )
+
+    with explanation_col:
+        st.subheader("5. Explanation / Risk Drivers")
+
+        if result["mode"] == "Existing borrower":
+            risk_drivers, support_drivers = get_drivers(
+                explanations,
+                int(result["borrower_id"]),
+            )
+        else:
+            risk_drivers, support_drivers = [], []
+
+        if risk_drivers:
+            st.markdown("**Main risk drivers**")
+            for driver in risk_drivers:
+                st.write(f"- {driver}")
+        else:
+            st.write("No borrower-level risk driver artifact is available for this application.")
+
+        if support_drivers:
+            st.markdown("**Supportive factors**")
+            for driver in support_drivers:
+                st.write(f"- {driver}")
+
+        st.markdown("**Limitations**")
+        st.write(
+            "- Pricing is a decision-support simulation, not a regulatory pricing engine.\n"
+            "- LGD is assumption-based because recovery outcomes are unavailable.\n"
+            "- New-borrower scoring uses a form-based profile and a repayment-history assumption.\n"
+            "- Stress testing is a what-if overlay, not a retrained model prediction.\n"
+            "- Final lending action should remain subject to underwriting policy and analyst review."
+        )
