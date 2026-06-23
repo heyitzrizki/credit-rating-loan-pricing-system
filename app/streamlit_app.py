@@ -2,7 +2,6 @@ import streamlit as st
 
 st.set_page_config(
     page_title="Credit Rating & ECL Stress Testing Engine",
-    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -64,7 +63,7 @@ st.markdown(
 st.markdown(
     """
     <div class="hero-card">
-        <div class="hero-title">📊 Credit Rating & ECL Stress Testing Engine</div>
+        <div class="hero-title">Credit Rating & ECL Stress Testing Engine</div>
         <div class="hero-subtitle">
             Enterprise-style dashboard for borrower credit rating, adjusted default risk estimation, expected credit loss simulation,
             macro stress testing, portfolio monitoring, and high-risk watchlist management.
