@@ -115,6 +115,106 @@ def combine_credit_and_pricing_decision(credit_recommendation, pricing_decision)
     return pricing_decision
 
 
+STRESS_REPAYMENT_OPTIONS = [
+    "No change",
+    "Mild deterioration",
+    "Repeated late payments",
+    "Severe delinquency",
+]
+
+
+def stress_defaults_from_grade(grade):
+    grade = str(grade).upper()
+    if grade in {"AAA", "AA", "A"}:
+        return {
+            "income_decline_pct": 10,
+            "exposure_increase_pct": 5,
+            "repayment_stress": "No change",
+        }
+    if grade in {"BBB", "BB"}:
+        return {
+            "income_decline_pct": 15,
+            "exposure_increase_pct": 10,
+            "repayment_stress": "Mild deterioration",
+        }
+    if grade in {"B", "CCC"}:
+        return {
+            "income_decline_pct": 25,
+            "exposure_increase_pct": 15,
+            "repayment_stress": "Mild deterioration",
+        }
+    return {
+        "income_decline_pct": 40,
+        "exposure_increase_pct": 25,
+        "repayment_stress": "Repeated late payments",
+    }
+
+
+def stress_defaults_from_new_borrower(income, requested_credit, temporal_assumption):
+    defaults_by_history = {
+        "No prior repayment history": (20, 10, "Mild deterioration"),
+        "Stable payer": (10, 5, "No change"),
+        "Mild deterioration": (25, 15, "Mild deterioration"),
+        "High delinquency": (45, 30, "Repeated late payments"),
+        "Recovering borrower": (15, 10, "Mild deterioration"),
+    }
+    income_decline, exposure_increase, repayment_stress = defaults_by_history.get(
+        temporal_assumption,
+        (20, 10, "Mild deterioration"),
+    )
+
+    credit_to_income = requested_credit / max(income, 1.0)
+    if credit_to_income >= 5:
+        income_decline += 15
+        exposure_increase += 15
+        repayment_stress = "Repeated late payments"
+    elif credit_to_income >= 3:
+        income_decline += 10
+        exposure_increase += 10
+
+    return {
+        "income_decline_pct": min(income_decline, 80),
+        "exposure_increase_pct": min(exposure_increase, 100),
+        "repayment_stress": repayment_stress,
+    }
+
+
+def render_stress_inputs(prefix, defaults):
+    st.subheader("Stress Scenario / What-if")
+    s1, s2 = st.columns(2)
+    income_decline_pct = s1.slider(
+        "Income decline",
+        min_value=0,
+        max_value=80,
+        value=int(defaults["income_decline_pct"]),
+        step=5,
+        format="%d%%",
+        key=f"{prefix}_income_decline_pct",
+    )
+    exposure_increase_pct = s2.slider(
+        "Exposure increase",
+        min_value=0,
+        max_value=100,
+        value=int(defaults["exposure_increase_pct"]),
+        step=5,
+        format="%d%%",
+        key=f"{prefix}_exposure_increase_pct",
+    )
+    repayment_default = defaults["repayment_stress"]
+    repayment_stress = st.selectbox(
+        "Repayment behavior",
+        STRESS_REPAYMENT_OPTIONS,
+        index=STRESS_REPAYMENT_OPTIONS.index(repayment_default),
+        key=f"{prefix}_repayment_stress",
+    )
+
+    return {
+        "income_decline_pct": income_decline_pct,
+        "exposure_increase_pct": exposure_increase_pct,
+        "repayment_stress": repayment_stress,
+    }
+
+
 def get_drivers(explanations, borrower_id):
     if explanations.empty:
         return [], []
@@ -299,6 +399,14 @@ with left:
             tail_risk_multiplier = a2.slider("Tail risk multiplier", 0.00, 2.00, 0.35, 0.05)
             max_allowed_rate = a1.slider("Maximum allowed rate", 0.05, 0.60, 0.30, 0.005)
 
+            existing_stress_defaults = stress_defaults_from_grade(
+                selected_row.get("credit_grade", "Unrated")
+            )
+            stress_inputs = render_stress_inputs(
+                prefix=f"existing_{int(selected_borrower)}",
+                defaults=existing_stress_defaults,
+            )
+
             submitted = st.form_submit_button(
                 "Run Credit & Pricing Decision",
                 use_container_width=True,
@@ -344,6 +452,7 @@ with left:
                     "score_source": score_source,
                     "loan_amount": loan_amount,
                     "pricing": pricing,
+                    "stress_inputs": stress_inputs,
                     "final_decision": final_decision,
                 }
     else:
@@ -425,6 +534,19 @@ with left:
             tail_risk_multiplier = a2.slider("Tail risk multiplier", 0.00, 2.00, 0.35, 0.05)
             max_allowed_rate = a1.slider("Maximum allowed rate", 0.05, 0.60, 0.30, 0.005)
 
+            new_stress_defaults = stress_defaults_from_new_borrower(
+                income=income,
+                requested_credit=requested_credit,
+                temporal_assumption=temporal_assumption,
+            )
+            debt_burden = requested_credit / max(income, 1.0)
+            debt_bucket = "high" if debt_burden >= 5 else "medium" if debt_burden >= 3 else "standard"
+            history_key = temporal_assumption.lower().replace(" ", "_").replace("-", "_")
+            stress_inputs = render_stress_inputs(
+                prefix=f"new_{history_key}_{debt_bucket}",
+                defaults=new_stress_defaults,
+            )
+
             submitted = st.form_submit_button(
                 "Run Credit & Pricing Decision",
                 use_container_width=True,
@@ -492,6 +614,7 @@ with left:
                     "score_source": score_source,
                     "loan_amount": loan_amount,
                     "pricing": pricing,
+                    "stress_inputs": stress_inputs,
                     "final_decision": final_decision,
                 }
 
@@ -571,40 +694,20 @@ if result is not None:
     with stress_col:
         st.subheader("4. Stress Scenario / What-if")
 
-        s1, s2 = st.columns(2)
-        income_decline_pct = s1.slider(
-            "Income decline",
-            min_value=0,
-            max_value=80,
-            value=20,
-            step=5,
-            format="%d%%",
-        )
-        exposure_increase_pct = s2.slider(
-            "Exposure increase",
-            min_value=0,
-            max_value=100,
-            value=10,
-            step=5,
-            format="%d%%",
-        )
-        repayment_stress = st.selectbox(
-            "Repayment behavior",
-            [
-                "No change",
-                "Mild deterioration",
-                "Repeated late payments",
-                "Severe delinquency",
-            ],
-            index=1,
+        stress_inputs = result.get("stress_inputs") or stress_defaults_from_grade(grade)
+        st.caption(
+            "Scenario used in this decision run: "
+            f"income decline {stress_inputs['income_decline_pct']}%, "
+            f"exposure increase {stress_inputs['exposure_increase_pct']}%, "
+            f"repayment behavior: {stress_inputs['repayment_stress']}."
         )
 
         stress = apply_borrower_stress(
             base_pd=pd_value,
             base_ead=loan_amount,
-            income_decline_pct=income_decline_pct,
-            exposure_increase_pct=exposure_increase_pct,
-            repayment_stress=repayment_stress,
+            income_decline_pct=stress_inputs["income_decline_pct"],
+            exposure_increase_pct=stress_inputs["exposure_increase_pct"],
+            repayment_stress=stress_inputs["repayment_stress"],
         )
         stressed_ecl = stress["stressed_pd"] * lgd * stress["stressed_ead"]
 
